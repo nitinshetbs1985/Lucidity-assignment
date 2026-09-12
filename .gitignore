@@ -1,0 +1,13 @@
+# Secrets and credentials
+.env
+*.pem
+slack-secret.json
+.aws/
+# Python
+__pycache__/
+*.pyc
+# Ansible
+*.retry
+# Editor/OS
+.DS_Store
+.vscode/
