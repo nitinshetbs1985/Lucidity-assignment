@@ -1,0 +1,56 @@
+{
+  "start": "-PT24H",
+  "periodOverride": "inherit",
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0, "y": 0, "width": 24, "height": 2,
+      "properties": {
+        "markdown": "# Central EC2 disk monitoring\nMetrics are shared from member accounts through CloudWatch cross-account observability. Warning: 80%. Critical: 90%."
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 2, "width": 24, "height": 8,
+      "properties": {
+        "title": "Highest disk utilization across linked source accounts",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "${AWS::Region}",
+        "period": 300,
+        "stat": "Maximum",
+        "yAxis": {"left": {"min": 0, "max": 100}},
+        "annotations": {
+          "horizontal": [
+            {"label": "Warning", "value": 80, "color": "#ff9900"},
+            {"label": "Critical", "value": 90, "color": "#d13212"}
+          ]
+        },
+        "metrics": [
+          [{"expression": "SELECT MAX(disk_used_percent) FROM SCHEMA(CWAgent, InstanceId, path, fstype) GROUP BY AWS.AccountId, InstanceId, path", "label": "Disk utilization", "id": "q1", "period": 300}]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 10, "width": 12, "height": 6,
+      "properties": {
+        "title": "Fleet maximum disk utilization",
+        "view": "singleValue",
+        "region": "${AWS::Region}",
+        "period": 300,
+        "metrics": [
+          [{"expression": "SELECT MAX(disk_used_percent) FROM CWAgent", "label": "Maximum used %", "id": "q2", "period": 300}]
+        ]
+      }
+    },
+    {
+      "type": "alarm",
+      "x": 12, "y": 10, "width": 12, "height": 6,
+      "properties": {
+        "title": "Disk alarms",
+        "alarms": ["${WarningAlarmArn}", "${CriticalAlarmArn}"]
+      }
+    }
+  ]
+}

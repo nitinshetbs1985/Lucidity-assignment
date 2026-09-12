@@ -1,0 +1,15 @@
+---
+plugin: amazon.aws.aws_ec2
+regions:
+  - <type your region example eu-central-1>
+filters:
+  instance-state-name: running
+  tag:Monitoring: enabled
+keyed_groups:
+  - key: tags.Environment | default('unknown')
+    prefix: env
+compose:
+  ansible_host: private_ip_address
+hostnames:
+  - tag:Name
+  - instance-id
