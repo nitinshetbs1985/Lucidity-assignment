@@ -1,0 +1,22 @@
+---
+- name: Check EC2 monitoring agents
+  hosts: monitored
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Check SSM Agent
+      ansible.builtin.command: systemctl is-active amazon-ssm-agent
+      register: ssm
+      changed_when: false
+
+    - name: Check CloudWatch Agent
+      ansible.builtin.command: systemctl is-active amazon-cloudwatch-agent
+      register: cloudwatch
+      changed_when: false
+
+    - name: Show agent status
+      ansible.builtin.debug:
+        msg:
+          - "SSM Agent: {{ ssm.stdout }}"
+          - "CloudWatch Agent: {{ cloudwatch.stdout }}"

@@ -1,36 +1,15 @@
 ---
-- name: Perform an on-demand Linux disk audit
-  hosts: monitored_linux
+- name: Audit EC2 disk usage
+  hosts: monitored
   become: false
   gather_facts: false
 
   tasks:
-    - name: Collect filesystem utilization in POSIX format
-      ansible.builtin.command: df -P -x tmpfs -x devtmpfs
-      register: disk_report
+    - name: Check disk usage
+      ansible.builtin.command: df -hT
+      register: disk_usage
       changed_when: false
 
-    - name: Identify filesystems at or above the audit threshold
-      ansible.builtin.shell: |
-        set -o pipefail
-        df -P -x tmpfs -x devtmpfs | awk -v threshold="{{ disk_threshold | default(80) | int }}" \
-          'NR > 1 {gsub(/%/, "", $5); if ($5 >= threshold) print $0}'
-      args:
-        executable: /bin/bash
-      register: threshold_report
-      changed_when: false
-
-    - name: Display full disk report
+    - name: Show disk usage
       ansible.builtin.debug:
-        var: disk_report.stdout_lines
-
-    - name: Display filesystems above threshold
-      ansible.builtin.debug:
-        msg: "{{ threshold_report.stdout_lines | default([]) }}"
-
-    - name: Fail when a filesystem is at or above the threshold
-      ansible.builtin.fail:
-        msg: "One or more filesystems are at or above {{ disk_threshold | default(80) }}%."
-      when:
-        - fail_on_threshold | default(false) | bool
-        - threshold_report.stdout_lines | length > 0
+        var: disk_usage.stdout_lines
