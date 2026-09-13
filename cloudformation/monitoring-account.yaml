@@ -1,248 +1,103 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Central OAM sink, dashboard, fleet-level alarms, SNS, and Slack notifier.
+
+Description: Minimal central monitoring account for EC2 disk metrics.
 
 Parameters:
-  OrganizationId:
+  MemberAccountId:
     Type: String
-    AllowedPattern: '^o-[a-z0-9]{10,32}$'
-    Description: AWS Organizations ID allowed to create OAM links.
-  SlackWebhookSecretArn:
-    Type: String
-    Description: Existing Secrets Manager secret ARN containing the Slack webhook URL or {"webhook_url":"..."}.
+    Default: '685385421611'
+
   DashboardName:
     Type: String
-    Default: Central-EC2-Disk-Monitoring
-  WarningThreshold:
-    Type: Number
-    Default: 80
-    MinValue: 1
-    MaxValue: 100
-  CriticalThreshold:
-    Type: Number
-    Default: 90
-    MinValue: 1
-    MaxValue: 100
-  EvaluationPeriods:
-    Type: Number
-    Default: 2
-    MinValue: 1
-  NotificationEmail:
-    Type: String
-    Default: ''
-
-Conditions:
-  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+    Default: Sandbox-EC2-Disk-Monitoring
 
 Resources:
+
+  # ------------------------------------------------------------
+  # OAM SINK
+  # ------------------------------------------------------------
   MonitoringSink:
     Type: AWS::Oam::Sink
     Properties:
       Name: !Sub '${AWS::StackName}-sink'
-      Tags:
-        Solution: CentralDiskMonitoring
 
-  MonitoringSinkPolicy:
-    Type: AWS::Oam::SinkPolicy
-    Properties:
-      SinkIdentifier: !Ref MonitoringSink
       Policy:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowOrganizationLinks
+          - Sid: AllowMemberAccount
             Effect: Allow
-            Principal: '*'
+            Principal:
+              AWS: !Ref MemberAccountId
             Action:
               - oam:CreateLink
               - oam:UpdateLink
             Resource: '*'
             Condition:
-              StringEquals:
-                aws:PrincipalOrgID: !Ref OrganizationId
               ForAllValues:StringEquals:
                 oam:ResourceTypes:
                   - AWS::CloudWatch::Metric
 
-  DiskAlertTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub '${AWS::StackName}-disk-alerts'
-      KmsMasterKeyId: alias/aws/sns
-      Tags:
-        - {Key: Solution, Value: CentralDiskMonitoring}
-
-  EmailSubscription:
-    Type: AWS::SNS::Subscription
-    Condition: HasNotificationEmail
-    Properties:
-      Protocol: email
-      Endpoint: !Ref NotificationEmail
-      TopicArn: !Ref DiskAlertTopic
-
-  SlackNotifierRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: {Service: lambda.amazonaws.com}
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-      Policies:
-        - PolicyName: ReadSlackWebhookSecret
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref SlackWebhookSecretArn
-
-  SlackNotifierFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${AWS::StackName}-slack-notifier'
-      Runtime: python3.12
-      Handler: index.lambda_handler
-      Role: !GetAtt SlackNotifierRole.Arn
-      Timeout: 20
-      MemorySize: 128
-      Environment:
-        Variables:
-          SLACK_SECRET_ARN: !Ref SlackWebhookSecretArn
-          SLACK_SECRET_JSON_KEY: webhook_url
-          LOG_LEVEL: INFO
-      Code:
-        ZipFile: |
-          import json, logging, os, time, urllib.request, boto3
-          LOG=logging.getLogger(); LOG.setLevel(os.getenv('LOG_LEVEL','INFO'))
-          SECRETS=boto3.client('secretsmanager')
-          _CACHE_TTL=300; _cached_webhook=None; _cached_at=0.0
-          def _webhook_url():
-              global _cached_webhook,_cached_at
-              if _cached_webhook and (time.time()-_cached_at)<_CACHE_TTL:
-                  return _cached_webhook
-              raw=SECRETS.get_secret_value(SecretId=os.environ['SLACK_SECRET_ARN']).get('SecretString')
-              if not raw: raise ValueError('Slack secret must contain SecretString')
-              key=os.getenv('SLACK_SECRET_JSON_KEY','webhook_url')
-              try:
-                  parsed=json.loads(raw); _cached_webhook=parsed[key] if isinstance(parsed,dict) else parsed
-              except json.JSONDecodeError: _cached_webhook=raw
-              if not isinstance(_cached_webhook,str) or not _cached_webhook.startswith('https://'):
-                  raise ValueError('Invalid Slack webhook URL')
-              _cached_at=time.time(); return _cached_webhook
-          def _format_alarm(message):
-              try: alarm=json.loads(message)
-              except json.JSONDecodeError: return {'text':f'AWS notification\n```{message[:2500]}```'}
-              name=alarm.get('AlarmName','CloudWatch alarm'); state=alarm.get('NewStateValue','UNKNOWN')
-              reason=alarm.get('NewStateReason','No reason supplied')
-              region=alarm.get('Region','Unknown region'); account=alarm.get('AWSAccountId','Unknown account')
-              icon={'ALARM':':rotating_light:','OK':':white_check_mark:'}.get(state,':warning:')
-              return {'text':f'{icon} {name} is {state}','blocks':[
-                  {'type':'header','text':{'type':'plain_text','text':f'{name}: {state}','emoji':True}},
-                  {'type':'section','fields':[
-                      {'type':'mrkdwn','text':f'*Account*\n{account}'},
-                      {'type':'mrkdwn','text':f'*Region*\n{region}'}
-                  ]},
-                  {'type':'section','text':{'type':'mrkdwn','text':f'*Reason*\n{reason[:2500]}'}}
-              ]}
-          def lambda_handler(event, context):
-              failures=[]
-              for record in event.get('Records',[]):
-                  try:
-                      payload=_format_alarm(record['Sns']['Message'])
-                      req=urllib.request.Request(_webhook_url(),data=json.dumps(payload).encode('utf-8'),
-                          headers={'Content-Type':'application/json'},method='POST')
-                      with urllib.request.urlopen(req,timeout=10) as resp:
-                          if not 200<=resp.status<300: raise RuntimeError(f'Slack returned HTTP {resp.status}')
-                      LOG.info('Delivered SNS message %s',record['Sns'].get('MessageId'))
-                  except Exception as exc:
-                      LOG.exception('Delivery failed'); failures.append(str(exc))
-              if failures: raise RuntimeError('; '.join(failures))
-              return {'processed':len(event.get('Records',[]))}
-      Tags:
-        - {Key: Solution, Value: CentralDiskMonitoring}
-
-  AllowSnsInvokeLambda:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref SlackNotifierFunction
-      Principal: sns.amazonaws.com
-      SourceArn: !Ref DiskAlertTopic
-
-  SlackSubscription:
-    Type: AWS::SNS::Subscription
-    DependsOn: AllowSnsInvokeLambda
-    Properties:
-      Protocol: lambda
-      Endpoint: !GetAtt SlackNotifierFunction.Arn
-      TopicArn: !Ref DiskAlertTopic
-
-  DiskWarningAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub '${AWS::StackName}-fleet-disk-warning'
-      AlarmDescription: !Sub 'Fleet maximum disk_used_percent is at least ${WarningThreshold}%.'
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      Threshold: !Ref WarningThreshold
-      EvaluationPeriods: !Ref EvaluationPeriods
-      DatapointsToAlarm: !Ref EvaluationPeriods
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref DiskAlertTopic]
-      OKActions: [!Ref DiskAlertTopic]
-      Metrics:
-        - Id: q1
-          Expression: SELECT MAX(disk_used_percent) FROM CWAgent
-          Label: Fleet maximum disk usage
-          Period: 300
-          ReturnData: true
-
-  DiskCriticalAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub '${AWS::StackName}-fleet-disk-critical'
-      AlarmDescription: !Sub 'Fleet maximum disk_used_percent is at least ${CriticalThreshold}%.'
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      Threshold: !Ref CriticalThreshold
-      EvaluationPeriods: !Ref EvaluationPeriods
-      DatapointsToAlarm: !Ref EvaluationPeriods
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref DiskAlertTopic]
-      OKActions: [!Ref DiskAlertTopic]
-      Metrics:
-        - Id: q1
-          Expression: SELECT MAX(disk_used_percent) FROM CWAgent
-          Label: Fleet maximum disk usage
-          Period: 300
-          ReturnData: true
-
+  # ------------------------------------------------------------
+  # DASHBOARD
+  # ------------------------------------------------------------
   DiskDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
       DashboardName: !Ref DashboardName
-      DashboardBody: !Sub
-        - |
-          {
-            "start":"-PT24H","periodOverride":"inherit","widgets":[
-              {"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"# Central EC2 disk monitoring\\nWarning: ${WarningThreshold}%. Critical: ${CriticalThreshold}%."}},
-              {"type":"metric","x":0,"y":2,"width":24,"height":8,"properties":{"title":"Disk utilization by account, instance, and path","view":"timeSeries","region":"${AWS::Region}","period":300,"stat":"Maximum","yAxis":{"left":{"min":0,"max":100}},"annotations":{"horizontal":[{"label":"Warning","value":${WarningThreshold},"color":"#ff9900"},{"label":"Critical","value":${CriticalThreshold},"color":"#d13212"}]},"metrics":[[{"expression":"SELECT MAX(disk_used_percent) FROM SCHEMA(CWAgent, InstanceId, path, fstype) GROUP BY AWS.AccountId, InstanceId, path","label":"Disk used %","id":"q1","period":300}]]}},
-              {"type":"metric","x":0,"y":10,"width":12,"height":6,"properties":{"title":"Fleet maximum","view":"singleValue","region":"${AWS::Region}","period":300,"metrics":[[{"expression":"SELECT MAX(disk_used_percent) FROM CWAgent","label":"Maximum used %","id":"q2","period":300}]]}},
-              {"type":"alarm","x":12,"y":10,"width":12,"height":6,"properties":{"title":"Fleet alarms","alarms":["${WarningArn}","${CriticalArn}"]}}
-            ]
-          }
-        - WarningArn: !GetAtt DiskWarningAlarm.Arn
-          CriticalArn: !GetAtt DiskCriticalAlarm.Arn
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 8,
+              "properties": {
+                "title": "EC2 Disk Utilization",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "CWAgent",
+                    "disk_used_percent",
+                    "InstanceId",
+                    "*"
+                  ]
+                ]
+              }
+            }
+          ]
+        }
+
+  # ------------------------------------------------------------
+  # SIMPLE DISK ALARM
+  # ------------------------------------------------------------
+  DiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-disk-high'
+      AlarmDescription: EC2 disk utilization above 80%
+
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+      TreatMissingData: notBreaching
 
 Outputs:
+
   SinkArn:
+    Description: OAM Sink ARN for the member account
     Value: !GetAtt MonitoringSink.Arn
-    Description: Pass this value to MonitoringSinkIdentifier in the member-account StackSet.
-  AlertTopicArn:
-    Value: !Ref DiskAlertTopic
+
   DashboardName:
     Value: !Ref DashboardName
-  WarningAlarmArn:
-    Value: !GetAtt DiskWarningAlarm.Arn
-  CriticalAlarmArn:
-    Value: !GetAtt DiskCriticalAlarm.Arn

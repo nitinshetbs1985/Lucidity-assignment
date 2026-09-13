@@ -1,196 +1,167 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Member-account resources for EC2 disk monitoring with SSM, CloudWatch Agent, and OAM.
+
+Description: Minimal EC2 disk monitoring configuration.
 
 Parameters:
+
   MonitoringSinkIdentifier:
     Type: String
-    Description: ARN of the OAM sink in the monitoring account.
+    Description: OAM Sink ARN from the monitoring account.
+
   MonitoringTagValue:
     Type: String
     Default: enabled
+
   AgentConfigParameterName:
     Type: String
     Default: /central-monitoring/cloudwatch-agent/linux
-  AssociationSchedule:
-    Type: String
-    Default: rate(30 minutes)
-  MaxConcurrency:
-    Type: String
-    Default: 10%
-  MaxErrors:
-    Type: String
-    Default: 1
 
 Resources:
+
+  # ------------------------------------------------------------
+  # EC2 / SSM / CLOUDWATCH AGENT ROLE
+  # ------------------------------------------------------------
   DiskMonitorRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: Allows EC2 instances to register with SSM and publish CloudWatch Agent metrics.
+      RoleName: !Sub '${AWS::StackName}-EC2MonitoringRole'
+
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: {Service: ec2.amazonaws.com}
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: SsmAgentCorePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: SsmAgentOperations
-                Effect: Allow
-                Action:
-                  - ssm:DescribeAssociation
-                  - ssm:GetDeployablePatchSnapshotForInstance
-                  - ssm:GetDocument
-                  - ssm:DescribeDocument
-                  - ssm:GetManifest
-                  - ssm:ListAssociations
-                  - ssm:ListInstanceAssociations
-                  - ssm:PutInventory
-                  - ssm:PutComplianceItems
-                  - ssm:PutConfigurePackageResult
-                  - ssm:UpdateAssociationStatus
-                  - ssm:UpdateInstanceAssociationStatus
-                  - ssm:UpdateInstanceInformation
-                Resource: '*'
-              - Sid: SsmGetAgentConfigParameter
-                Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                  - ssm:GetParameters
-                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AgentConfigParameterName}'
-              - Sid: SsmMessaging
-                Effect: Allow
-                Action:
-                  - ssmmessages:CreateControlChannel
-                  - ssmmessages:CreateDataChannel
-                  - ssmmessages:OpenControlChannel
-                  - ssmmessages:OpenDataChannel
-                  - ec2messages:AcknowledgeMessage
-                  - ec2messages:DeleteMessage
-                  - ec2messages:FailMessage
-                  - ec2messages:GetEndpoint
-                  - ec2messages:GetMessages
-                  - ec2messages:SendReply
-                Resource: '*'
-              - Sid: SsmPackageDownload
-                Effect: Allow
-                Action: s3:GetObject
-                Resource: !Sub 'arn:${AWS::Partition}:s3:::aws-ssm-${AWS::Region}/*'
-        - PolicyName: CloudWatchAgentMetricsPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: PublishCWAgentMetrics
-                Effect: Allow
-                Action: cloudwatch:PutMetricData
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    cloudwatch:namespace: CWAgent
-              - Sid: Ec2DimensionsForAgent
-                Effect: Allow
-                Action:
-                  - ec2:DescribeVolumes
-                  - ec2:DescribeTags
-                Resource: '*'
-      Tags:
-        - {Key: Solution, Value: CentralDiskMonitoring}
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
 
   DiskMonitorInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      Roles: [!Ref DiskMonitorRole]
+      Roles:
+        - !Ref DiskMonitorRole
 
-  CloudWatchAgentConfigParameter:
+  # ------------------------------------------------------------
+  # CLOUDWATCH AGENT CONFIGURATION
+  # ------------------------------------------------------------
+  CloudWatchAgentConfig:
     Type: AWS::SSM::Parameter
     Properties:
       Name: !Ref AgentConfigParameterName
       Type: String
-      Description: Linux CloudWatch Agent configuration for disk utilization.
+
       Value: |
         {
-          "agent": {"metrics_collection_interval": 300, "run_as_user": "root"},
+          "agent": {
+            "metrics_collection_interval": 300,
+            "run_as_user": "root"
+          },
           "metrics": {
             "namespace": "CWAgent",
+
             "append_dimensions": {
-              "InstanceId": "${aws:InstanceId}",
-              "InstanceType": "${aws:InstanceType}",
-              "AutoScalingGroupName": "${aws:AutoScalingGroupName}"
+              "InstanceId": "${aws:InstanceId}"
             },
-            "aggregation_dimensions": [["InstanceId"]],
+
             "metrics_collected": {
               "disk": {
-                "measurement": ["used_percent"],
+                "measurement": [
+                  "used_percent"
+                ],
                 "metrics_collection_interval": 300,
-                "resources": ["*"],
-                "ignore_file_system_types": ["sysfs", "devtmpfs", "tmpfs", "overlay", "squashfs", "proc", "procfs", "devfs"],
+                "resources": [
+                  "*"
+                ],
+                "ignore_file_system_types": [
+                  "sysfs",
+                  "devtmpfs",
+                  "tmpfs",
+                  "overlay",
+                  "squashfs",
+                  "proc",
+                  "procfs"
+                ],
                 "drop_device": true
               }
             }
           }
         }
-      Tags:
-        Solution: CentralDiskMonitoring
 
-  InstallCloudWatchAgentAssociation:
+  # ------------------------------------------------------------
+  # INSTALL CLOUDWATCH AGENT
+  # ------------------------------------------------------------
+  InstallCloudWatchAgent:
     Type: AWS::SSM::Association
     Properties:
-      AssociationName: !Sub '${AWS::StackName}-install-cloudwatch-agent'
       Name: AWS-ConfigureAWSPackage
+
       Parameters:
-        action: [Install]
-        installationType: [Uninstall and reinstall]
-        name: [AmazonCloudWatchAgent]
-        version: [latest]
+        action:
+          - Install
+        installationType:
+          - Uninstall and reinstall
+        name:
+          - AmazonCloudWatchAgent
+        version:
+          - latest
+
       Targets:
         - Key: tag:Monitoring
-          Values: [!Ref MonitoringTagValue]
-      ScheduleExpression: !Ref AssociationSchedule
-      ApplyOnlyAtCronInterval: false
-      MaxConcurrency: !Ref MaxConcurrency
-      MaxErrors: !Ref MaxErrors
-      ComplianceSeverity: MEDIUM
-      SyncCompliance: AUTO
+          Values:
+            - !Ref MonitoringTagValue
 
-  ConfigureCloudWatchAgentAssociation:
+  # ------------------------------------------------------------
+  # CONFIGURE CLOUDWATCH AGENT
+  # ------------------------------------------------------------
+  ConfigureCloudWatchAgent:
     Type: AWS::SSM::Association
-    DependsOn: InstallCloudWatchAgentAssociation
+    DependsOn: InstallCloudWatchAgent
+
     Properties:
-      AssociationName: !Sub '${AWS::StackName}-configure-cloudwatch-agent'
       Name: AmazonCloudWatch-ManageAgent
+
       Parameters:
-        action: [configure]
-        mode: [ec2]
-        optionalConfigurationSource: [ssm]
-        optionalConfigurationLocation: [!Ref AgentConfigParameterName]
-        optionalRestart: ['yes']
+        action:
+          - configure
+        mode:
+          - ec2
+        optionalConfigurationSource:
+          - ssm
+        optionalConfigurationLocation:
+          - !Ref AgentConfigParameterName
+        optionalRestart:
+          - 'yes'
+
       Targets:
         - Key: tag:Monitoring
-          Values: [!Ref MonitoringTagValue]
-      ScheduleExpression: !Ref AssociationSchedule
-      ApplyOnlyAtCronInterval: false
-      MaxConcurrency: !Ref MaxConcurrency
-      MaxErrors: !Ref MaxErrors
-      ComplianceSeverity: HIGH
-      SyncCompliance: AUTO
+          Values:
+            - !Ref MonitoringTagValue
 
+  # ------------------------------------------------------------
+  # OAM LINK
+  # ------------------------------------------------------------
   MonitoringLink:
     Type: AWS::Oam::Link
+
     Properties:
       LabelTemplate: '$AccountName'
+
       ResourceTypes:
         - AWS::CloudWatch::Metric
+
       SinkIdentifier: !Ref MonitoringSinkIdentifier
-      Tags:
-        Solution: CentralDiskMonitoring
 
 Outputs:
+
   InstanceProfileName:
+    Description: IAM instance profile for monitored EC2 instances
     Value: !Ref DiskMonitorInstanceProfile
-    Description: Attach this profile to monitored EC2 instances or reference it in the launch template.
-  AgentConfigParameter:
-    Value: !Ref CloudWatchAgentConfigParameter
+
   OamLinkArn:
+    Description: OAM Link ARN
     Value: !GetAtt MonitoringLink.Arn
