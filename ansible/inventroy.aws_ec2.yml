@@ -8,6 +8,9 @@ filters:
 keyed_groups:
   - key: tags.Environment | default('unknown')
     prefix: env
+groups:
+  monitored_linux: "'Monitoring' in (tags | default({}))"
+  legacy_linux: "'LegacyHost' in (tags | default({}))"
 compose:
   ansible_host: private_ip_address
 hostnames:

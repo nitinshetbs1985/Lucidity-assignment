@@ -6,18 +6,21 @@ be either a plain URL string or JSON containing the configured key.
 import json
 import logging
 import os
+import time
 import urllib.request
 import boto3
 
 LOG = logging.getLogger()
 LOG.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 SECRETS = boto3.client("secretsmanager")
+_CACHE_TTL = 300  # re-fetch after 5 min to pick up rotated secrets
 _cached_webhook = None
+_cached_at = 0.0
 
 
 def _webhook_url():
-    global _cached_webhook
-    if _cached_webhook:
+    global _cached_webhook, _cached_at
+    if _cached_webhook and (time.time() - _cached_at) < _CACHE_TTL:
         return _cached_webhook
     response = SECRETS.get_secret_value(SecretId=os.environ["SLACK_SECRET_ARN"])
     raw = response.get("SecretString")
@@ -31,6 +34,7 @@ def _webhook_url():
         _cached_webhook = raw
     if not isinstance(_cached_webhook, str) or not _cached_webhook.startswith("https://"):
         raise ValueError("Slack webhook secret is not a valid HTTPS URL")
+    _cached_at = time.time()
     return _cached_webhook
 
 

@@ -1,108 +1,147 @@
 # Centralized EC2 Disk Utilization Monitoring
 
-A deployable reference implementation for centralized Linux disk monitoring across AWS accounts. Member accounts use Systems Manager State Manager to install and configure the CloudWatch Agent. CloudWatch cross-account observability shares metrics with a monitoring account. The monitoring account provides a dashboard, fleet-level warning and critical alarms, SNS notifications, and a Lambda-based Slack notifier.
+Monitor disk usage across all your Linux EC2 instances from a single AWS account. Systems Manager installs and configures the CloudWatch Agent on each enrolled instance. CloudWatch cross-account observability (OAM) shares metrics with a central monitoring account, where a dashboard, fleet-level alarms, and a Slack notifier give you a single pane of glass.
 
-## Important design boundaries
+**What you get:**
+- A CloudWatch dashboard showing disk utilization per account, instance, and filesystem path
+- Fleet-level warning (80%) and critical (90%) alarms with configurable thresholds
+- Slack and optional email notifications via SNS + Lambda
+- Ansible playbooks for legacy hosts that cannot use SSM
 
-- The solution collects Linux `disk_used_percent` metrics. Windows needs a separate agent configuration and alarm strategy.
-- CloudWatch does not create disk-space dashboards or 80%/90% alarms automatically. This repository creates them.
-- OAM shares telemetry but does not install agents, attach IAM instance profiles, or create alarms.
-- Creating an instance profile does not attach it to existing EC2 instances. Reference the profile in a launch template or attach it as a controlled onboarding action.
-- The supplied 80% and 90% alarms evaluate the fleet maximum. They provide a scalable central signal, but the alarm message does not reliably identify the exact filesystem. The dashboard query groups by source account, instance, and path for investigation. Production environments that require per-filesystem alarm identity should add controlled alarm lifecycle automation.
-- Ansible is an exception path for legacy SSM bootstrap and on-demand audits. It is not the continuous metric collector.
+---
 
-## Repository layout
+## How it works
 
-```text
-cloudformation/
-  member-account-stackset.yaml  Member IAM, SSM configuration and associations, OAM link
-  monitoring-account.yaml       OAM sink/policy, dashboard, alarms, SNS, Lambda
-cloudwatch/
-  agent-config.json             Readable source of the embedded agent configuration
-  dashboard.json                Readable source/reference for dashboard widgets
-ansible/
-  ansible.cfg
-  inventory.aws_ec2.yml         Example dynamic inventory
-  requirements.yml
-  install-ssm-agent.yml         Legacy Linux bootstrap
-  disk-audit.yml                On-demand disk audit
-lambda/
-  slack-notification.py         Full source corresponding to the inline Lambda
- diagrams/
-  README.md                     Diagram export guidance
+```
+Member account (each)                        Monitoring account
+┌──────────────────────────────────┐         ┌────────────────────────────────────────┐
+│  EC2 instance                    │         │  CloudWatch dashboard                  │
+│  └─ IAM instance profile         │         │  Fleet alarms (warning / critical)     │
+│  └─ SSM Agent                    │──OAM──▶ │  SNS topic → Lambda → Slack           │
+│     └─ Installs CloudWatch Agent │         │  OAM sink (receives shared metrics)    │
+│  └─ CloudWatch Agent             │         └────────────────────────────────────────┘
+│     └─ Publishes disk_used_%     │
+└──────────────────────────────────┘
 ```
 
-## Prerequisites
+Metric flow: `CloudWatch Agent → CWAgent namespace → OAM link → monitoring account → alarms → SNS → Lambda → Slack`
 
-1. An AWS Organization and a dedicated monitoring account.
-2. CloudFormation StackSets trusted access if service-managed StackSets are used.
-3. Target EC2 instances must have network access to Systems Manager and CloudWatch endpoints through internet/NAT or VPC interface endpoints.
-4. EC2 instances must use an IAM instance profile with `AmazonSSMManagedInstanceCore` and `CloudWatchAgentServerPolicy`, or equivalent least-privilege policies.
-5. An existing AWS Secrets Manager secret holding a Slack incoming-webhook URL. Store either the plain URL or JSON such as `{"webhook_url":"https://hooks.slack.com/..."}`. Do not commit the URL.
-6. AWS CLI v2 and credentials with deployment permissions.
-7. For Ansible: Python 3, Ansible Core, the `amazon.aws` collection, and network/SSH access to legacy hosts.
+---
 
-## Deployment order
+## Prerequisites checklist
 
-### 1. Create the Slack secret
+Complete everything below before starting deployment.
 
-Example only. The shell history can expose values, so use an approved secret-entry workflow in production.
+- [ ] **AWS Organization** — you have an AWS Organization and a dedicated monitoring account.
+- [ ] **StackSets trusted access** — enable trusted access for CloudFormation StackSets in your Organizations management account (required for service-managed StackSets).
+- [ ] **AWS CLI v2** — installed and configured with credentials for the monitoring account and the management/delegated-admin account.
+- [ ] **Slack incoming webhook** — create one in Slack and have the URL ready. Do not commit it to source control.
+- [ ] **Notification email** — optional, for SNS email alerts alongside Slack.
+- [ ] **EC2 network access** — target instances can reach SSM, CloudWatch, and S3 endpoints via NAT, internet, or VPC interface endpoints.
+
+> **For Ansible (optional):** Python 3, Ansible Core ≥ 2.14, the `amazon.aws` collection, and SSH/network access to legacy hosts.
+
+---
+
+## Deployment
+
+### Step 0 — Set shell variables
+
+Run these once in your terminal. All commands in the steps below reference these variables so nothing is hardcoded.
 
 ```bash
-aws secretsmanager create-secret \
-  --name central-monitoring/slack-webhook \
-  --secret-string file://slack-secret.json \
-  --region us-east-1
+export MONITORING_ACCOUNT_REGION="us-east-1"                # region for the monitoring stack
+export MONITORING_STACK_NAME="central-disk-monitoring"       # name for the monitoring stack
+export MEMBER_STACKSET_NAME="central-disk-monitoring-member" # name for the member StackSet
+export ORG_ID="o-example12345"                               # your AWS Organizations ID
+export OU_ID="ou-xxxx-yyyyyyyy"                              # target OU for member accounts
+export NOTIFICATION_EMAIL="operations@example.com"           # leave empty ("") to skip email
+export SLACK_SECRET_NAME="central-monitoring/slack-webhook"  # Secrets Manager secret name
 ```
 
-Example local `slack-secret.json` that must not be committed:
+---
+
+### Step 1 — Store the Slack webhook in Secrets Manager
+
+Create a local file called `slack-secret.json`:
 
 ```json
 {"webhook_url":"https://hooks.slack.com/services/REPLACE/ME"}
 ```
 
-### 2. Deploy the monitoring-account stack
+Create the secret in the monitoring account:
+
+```bash
+aws secretsmanager create-secret \
+  --name "$SLACK_SECRET_NAME" \
+  --secret-string file://slack-secret.json \
+  --region "$MONITORING_ACCOUNT_REGION"
+```
+
+Retrieve and store the secret ARN for use in Step 2:
+
+```bash
+SLACK_SECRET_ARN=$(aws secretsmanager describe-secret \
+  --secret-id "$SLACK_SECRET_NAME" \
+  --query ARN --output text \
+  --region "$MONITORING_ACCOUNT_REGION")
+echo "$SLACK_SECRET_ARN"
+```
+
+> **Tip:** Delete `slack-secret.json` after this step. The URL is now safely stored in Secrets Manager and is no longer needed locally.
+
+---
+
+### Step 2 — Deploy the monitoring account stack
+
+This stack creates the OAM sink, CloudWatch dashboard, alarms, SNS topic, and the Slack Lambda notifier. Run it in the **monitoring account**.
 
 ```bash
 aws cloudformation deploy \
   --template-file cloudformation/monitoring-account.yaml \
-  --stack-name central-disk-monitoring \
+  --stack-name "$MONITORING_STACK_NAME" \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-      OrganizationId=o-example12345 \
-      SlackWebhookSecretArn=arn:aws:secretsmanager:us-east-1:111122223333:secret:central-monitoring/slack-webhook-xxxxxx \
-      NotificationEmail=operations@example.com \
-  --region us-east-1
+      OrganizationId="$ORG_ID" \
+      SlackWebhookSecretArn="$SLACK_SECRET_ARN" \
+      NotificationEmail="$NOTIFICATION_EMAIL" \
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
 
-Obtain the OAM sink ARN:
+After deployment, retrieve the OAM sink ARN (you will need it in Step 3):
 
 ```bash
 SINK_ARN=$(aws cloudformation describe-stacks \
-  --stack-name central-disk-monitoring \
+  --stack-name "$MONITORING_STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='SinkArn'].OutputValue" \
   --output text \
-  --region us-east-1)
+  --region "$MONITORING_ACCOUNT_REGION")
 echo "$SINK_ARN"
 ```
 
-If an email endpoint was supplied, confirm the SNS subscription from the mailbox.
+> **Note:** If you provided a notification email, check your inbox for an SNS subscription confirmation and click **Confirm subscription** before proceeding.
 
-### 3. Deploy the member template with StackSets
+**Expected result:** Stack status is `CREATE_COMPLETE`. The `Central-EC2-Disk-Monitoring` dashboard appears in CloudWatch — it shows no data yet, which is normal.
 
-Validate first:
+---
+
+### Step 3 — Deploy to member accounts via StackSets
+
+This step deploys the IAM instance profile, SSM parameter, and OAM link into every account in the target OU. Run from the **management account** (or your delegated StackSets administrator account).
+
+**Validate the template:**
 
 ```bash
 aws cloudformation validate-template \
   --template-body file://cloudformation/member-account-stackset.yaml \
-  --region us-east-1
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
 
-Create a service-managed StackSet:
+**Create the StackSet:**
 
 ```bash
 aws cloudformation create-stack-set \
-  --stack-set-name central-disk-monitoring-member \
+  --stack-set-name "$MEMBER_STACKSET_NAME" \
   --template-body file://cloudformation/member-account-stackset.yaml \
   --permission-model SERVICE_MANAGED \
   --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
@@ -110,132 +149,185 @@ aws cloudformation create-stack-set \
   --parameters \
       ParameterKey=MonitoringSinkIdentifier,ParameterValue="$SINK_ARN" \
       ParameterKey=MonitoringTagValue,ParameterValue=enabled \
-  --region us-east-1
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
 
-Create instances for a target organizational unit and Region:
+**Deploy instances to the target OU and region:**
 
 ```bash
 aws cloudformation create-stack-instances \
-  --stack-set-name central-disk-monitoring-member \
-  --deployment-targets OrganizationalUnitIds=ou-xxxx-yyyyyyyy \
-  --regions us-east-1 \
+  --stack-set-name "$MEMBER_STACKSET_NAME" \
+  --deployment-targets OrganizationalUnitIds="$OU_ID" \
+  --regions "$MONITORING_ACCOUNT_REGION" \
   --operation-preferences FailureTolerancePercentage=10,MaxConcurrentPercentage=25,RegionConcurrencyType=PARALLEL \
-  --region us-east-1
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
 
-Repeat stack instances for every required Region because SSM parameters, associations, CloudWatch metrics, and OAM links are regional.
+> **Note:** Repeat `create-stack-instances` for each additional AWS region you need to cover. SSM parameters, CloudWatch metrics, and OAM links are all regional.
 
-### 4. Enrol an EC2 instance
-
-1. Attach the generated instance profile through the instance's launch template, or attach it to an existing instance using your approved change process.
-2. Ensure SSM Agent is installed and running.
-3. Apply the tag `Monitoring=enabled`.
-4. Ensure outbound HTTPS access to regional SSM, SSM Messages, EC2 Messages where applicable, CloudWatch, and S3/package endpoints.
-5. State Manager installs the `AmazonCloudWatchAgent` Distributor package and configures it from `/central-monitoring/cloudwatch-agent/linux`.
-
-Example tag command:
+**Check deployment progress:**
 
 ```bash
-aws ec2 create-tags \
-  --resources i-0123456789abcdef0 \
-  --tags Key=Monitoring,Value=enabled \
-  --region us-east-1
+aws cloudformation list-stack-set-operations \
+  --stack-set-name "$MEMBER_STACKSET_NAME" \
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
+
+**Expected result:** Operation status is `SUCCEEDED`. Each member account now has an IAM instance profile, an SSM parameter at `/central-monitoring/cloudwatch-agent/linux`, and an active OAM link pointing to the monitoring account.
+
+---
+
+### Step 4 — Enrol an EC2 instance
+
+Do this for each instance you want to monitor.
+
+1. **Attach the instance profile** — the profile name is in the StackSet stack output (`InstanceProfileName`). Add it to the instance's launch template, or attach it to an existing instance using your approved change process.
+
+2. **Verify SSM Agent is installed and running** (on the instance):
+   ```bash
+   sudo systemctl status amazon-ssm-agent
+   ```
+
+3. **Apply the monitoring tag** — replace the instance ID with yours:
+   ```bash
+   aws ec2 create-tags \
+     --resources i-0123456789abcdef0 \
+     --tags Key=Monitoring,Value=enabled \
+     --region "$MONITORING_ACCOUNT_REGION"
+   ```
+
+4. **Wait for State Manager** — within the next association interval (default: 30 minutes), SSM State Manager automatically installs the CloudWatch Agent and applies the configuration.
+
+> **Tip:** To trigger the associations immediately instead of waiting, open **Systems Manager → State Manager** in the AWS Console, select each association, and choose **Apply association now**.
+
+**Expected result:** Within a few minutes of the associations running, `amazon-cloudwatch-agent` is active and `CWAgent/disk_used_percent` metrics start appearing in CloudWatch.
+
+---
 
 ## Verification
 
-### Member account
+### Member account checks
 
+**SSM managed node registration:**
 ```bash
 aws ssm describe-instance-information \
-  --filters Key=tag:Monitoring,Values=enabled \
-  --region us-east-1
+  --filters "Key=tag:Monitoring,Values=enabled" \
+  --query "InstanceInformationList[*].{ID:InstanceId,Ping:PingStatus,Agent:AgentVersion}" \
+  --output table \
+  --region "$MONITORING_ACCOUNT_REGION"
+```
 
+**State Manager association status:**
+```bash
 aws ssm list-associations \
-  --association-filter-list key=AssociationName,value=central-disk-monitoring-member-install-cloudwatch-agent \
-  --region us-east-1
+  --association-filter-list "key=AssociationName,value=${MEMBER_STACKSET_NAME}-install-cloudwatch-agent" \
+  --query "Associations[*].{Name:AssociationName,Status:Overview.Status,LastRun:LastExecutionDate}" \
+  --output table \
+  --region "$MONITORING_ACCOUNT_REGION"
+```
 
+**CloudWatch Agent metrics flowing:**
+```bash
 aws cloudwatch list-metrics \
   --namespace CWAgent \
   --metric-name disk_used_percent \
-  --region us-east-1
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
 
-On an enrolled Linux instance:
-
+**On an enrolled Linux instance:**
 ```bash
-sudo systemctl status amazon-ssm-agent
 sudo systemctl status amazon-cloudwatch-agent
 sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -m ec2 -a status
 ```
 
-### Monitoring account
+### Monitoring account checks
 
-1. Open the `Central-EC2-Disk-Monitoring` dashboard.
-2. Confirm linked-account series appear in the grouped Metrics Insights widget.
-3. Confirm the two fleet alarms are not in `INSUFFICIENT_DATA` after metrics have arrived.
-4. Test notification plumbing without filling a disk by publishing a temporary message to the SNS topic. This validates SNS, Lambda, Secrets Manager, and Slack, but not the CloudWatch alarm itself.
+1. Open the **`Central-EC2-Disk-Monitoring`** dashboard. Member account series should appear in the grouped time-series widget.
+2. Confirm the two fleet alarms (`*-fleet-disk-warning`, `*-fleet-disk-critical`) transition from `INSUFFICIENT_DATA` to `OK` once metrics arrive (allow 5–10 minutes).
+3. **Test Slack notifications end-to-end** by publishing a test message to the SNS topic:
 
 ```bash
 TOPIC_ARN=$(aws cloudformation describe-stacks \
-  --stack-name central-disk-monitoring \
+  --stack-name "$MONITORING_STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='AlertTopicArn'].OutputValue" \
   --output text \
-  --region us-east-1)
+  --region "$MONITORING_ACCOUNT_REGION")
 
 aws sns publish \
   --topic-arn "$TOPIC_ARN" \
   --message '{"AlarmName":"NotificationPathTest","NewStateValue":"ALARM","NewStateReason":"Controlled SNS-to-Slack test"}' \
-  --region us-east-1
+  --region "$MONITORING_ACCOUNT_REGION"
 ```
+
+A formatted Slack message should appear within a few seconds. This validates SNS, Lambda, Secrets Manager, and Slack without touching any instance.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | What to check |
+|---|---|---|
+| Instance not in SSM managed nodes | SSM Agent not installed or no network path to SSM endpoints | `systemctl status amazon-ssm-agent`; check VPC endpoints or NAT/internet gateway |
+| State Manager association failing | IAM permissions missing or agent not running | Review association execution history in SSM console; confirm `amazon-ssm-agent` is active |
+| No `CWAgent` metrics in CloudWatch | CloudWatch Agent not configured or not running | `amazon-cloudwatch-agent-ctl -a status`; verify the SSM parameter exists at `/central-monitoring/cloudwatch-agent/linux` |
+| No data in central dashboard | OAM link not active | Verify `MonitoringLink` exists in the member stack; check OAM linked sources in the monitoring account's CloudWatch settings |
+| Slack messages not arriving | Lambda error or wrong secret | Check Lambda logs at `/aws/lambda/<stack-name>-slack-notifier`; verify the secret ARN and `webhook_url` key in the secret |
+| Alarms stuck in `INSUFFICIENT_DATA` | Metrics not yet flowing centrally | Wait 5–10 minutes after first metrics appear; confirm `disk_used_percent` is visible in the member account first |
+
+---
 
 ## Operator runbook
 
-### Normal onboarding
+### Onboarding a new instance
 
-1. Confirm the account is in a targeted OU and the StackSet instance is current.
-2. Use the monitoring instance profile in the EC2 launch template.
+1. Confirm the account is in the targeted OU and the StackSet instance shows `CURRENT` status.
+2. Attach the monitoring IAM instance profile via the launch template or directly to the instance.
 3. Tag the instance `Monitoring=enabled`.
-4. Verify SSM managed-node registration and State Manager compliance.
-5. Verify `CWAgent/disk_used_percent` in the member account, then in the central dashboard.
+4. Verify the instance appears in SSM managed nodes and State Manager compliance is `Compliant`.
+5. Confirm `CWAgent/disk_used_percent` metrics appear in the member account, then in the central dashboard.
 
-### Warning response at 80%
+### Warning alarm response (80%)
 
-1. Open the central dashboard and find the source account, instance ID, and path above the threshold.
-2. Use Session Manager or the approved access path to run `df -hT` and identify growth.
-3. Check expected application/log retention and whether cleanup is authorized.
-4. Open or update the operational ticket, record evidence, and assign an owner.
-5. Apply the approved remediation: log rotation, cleanup, filesystem expansion, or application correction.
-6. Confirm the metric is below threshold and the alarm returns to OK.
+1. Open the dashboard and identify the source account, instance ID, and filesystem path above 80%.
+2. Connect via Session Manager and run `df -hT` to confirm usage and identify what is growing.
+3. Determine whether growth is expected (logs, backups, application data).
+4. Open or update an operational ticket with evidence and assign an owner.
+5. Apply the approved remediation: log rotation, cleanup, filesystem or EBS expansion, or application fix.
+6. Confirm the metric drops below the threshold and the alarm returns to `OK`.
 
-### Critical response at 90%
+### Critical alarm response (90%)
 
-Follow the warning procedure with incident priority appropriate to the service. Avoid deleting data without application-owner approval. If expanding EBS, follow the platform change process and extend the partition/filesystem only after the volume modification succeeds.
+Follow the warning procedure with incident-level priority appropriate to the service. Do not delete data without application-owner approval. For EBS expansion: resize the volume first, wait for the modification to complete, then extend the partition and filesystem.
 
-### Offboarding
+### Offboarding an instance
 
-1. Remove or change the `Monitoring` tag.
+1. Remove or change the `Monitoring` tag on the instance.
 2. Confirm State Manager no longer targets the instance.
-3. Retain or remove the agent according to the decommission standard.
+3. Retain or remove the CloudWatch Agent according to your decommission standard.
 4. Remove the instance profile only if no other required permissions depend on it.
 
-## Ansible operator path
+---
 
-Install requirements:
+## Ansible (legacy hosts)
+
+Use Ansible only for hosts that cannot run SSM Agent or as an on-demand audit tool. It does not replace continuous CloudWatch metric collection.
+
+**Install collection requirements:**
 
 ```bash
 cd ansible
 ansible-galaxy collection install -r requirements.yml
 ```
 
-Update `inventory.aws_ec2.yml` with the required Regions and configure AWS credentials through the approved identity mechanism. Test inventory:
+**Configure the inventory** — edit `inventory.aws_ec2.yml` and replace the placeholder region with your region. Set AWS credentials using your approved identity mechanism.
+
+**Verify the dynamic inventory resolves correctly:**
 
 ```bash
 ansible-inventory --graph
 ```
 
-Bootstrap SSM Agent only on a controlled legacy group:
+**Bootstrap SSM Agent on legacy hosts:**
 
 ```bash
 ansible-playbook install-ssm-agent.yml \
@@ -243,7 +335,7 @@ ansible-playbook install-ssm-agent.yml \
   --limit legacy_linux
 ```
 
-Run a read-only audit:
+**Run a read-only disk audit:**
 
 ```bash
 ansible-playbook disk-audit.yml \
@@ -251,7 +343,7 @@ ansible-playbook disk-audit.yml \
   -e disk_threshold=80
 ```
 
-To make the audit fail for CI or an operational wrapper when any path breaches the threshold:
+**Fail the playbook when any host exceeds the threshold** (useful in CI or automated checks):
 
 ```bash
 ansible-playbook disk-audit.yml \
@@ -260,35 +352,83 @@ ansible-playbook disk-audit.yml \
   -e fail_on_threshold=true
 ```
 
-## Files required on the operator machine
-
-- This repository.
-- AWS CLI configuration or an approved federated credential helper.
-- Ansible configuration, dynamic inventory, playbooks, and collections for legacy operations.
-- SSH private key only when unavoidable for a legacy host, protected outside Git.
-- No Slack webhook file after the secret is created. The webhook remains in Secrets Manager.
-
-## Security notes
-
-- Replace AWS managed policies with scoped customer-managed policies if organizational standards require it.
-- Restrict the monitoring stack deployment role and StackSet administration roles.
-- Use VPC endpoints where instances have no internet/NAT path.
-- Keep Slack URLs and private keys out of source control.
-- Enable CloudTrail and review StackSet drift and State Manager compliance.
-- The Lambda sends account, Region, alarm name, state, and CloudWatch reason. Review the Slack channel's data classification before use.
+---
 
 ## Removal
 
-1. Delete StackSet instances from member accounts and Regions.
-2. Delete the StackSet after instances are removed.
-3. Delete the monitoring stack.
+1. Delete all StackSet stack instances (member accounts and regions):
+   ```bash
+   aws cloudformation delete-stack-instances \
+     --stack-set-name "$MEMBER_STACKSET_NAME" \
+     --deployment-targets OrganizationalUnitIds="$OU_ID" \
+     --regions "$MONITORING_ACCOUNT_REGION" \
+     --no-retain-stacks \
+     --region "$MONITORING_ACCOUNT_REGION"
+   ```
+2. Once all instances are removed, delete the StackSet:
+   ```bash
+   aws cloudformation delete-stack-set \
+     --stack-set-name "$MEMBER_STACKSET_NAME" \
+     --region "$MONITORING_ACCOUNT_REGION"
+   ```
+3. Delete the monitoring account stack:
+   ```bash
+   aws cloudformation delete-stack \
+     --stack-name "$MONITORING_STACK_NAME" \
+     --region "$MONITORING_ACCOUNT_REGION"
+   ```
 4. Delete the Slack secret only after confirming no other workload uses it.
+
+---
+
+## Security notes
+
+- **IAM policies are scoped:** `cloudwatch:PutMetricData` on the instance role is restricted to the `CWAgent` namespace; `ssm:GetParameter` is restricted to the agent config parameter path only.
+- Restrict the monitoring stack deployment role and StackSet administration roles to only the permissions they need.
+- Use VPC interface endpoints where instances have no internet or NAT path: `ssm`, `ssmmessages`, `ec2messages`, and `monitoring` endpoints for the relevant region.
+- Keep Slack webhook URLs and SSH private keys out of source control.
+- Enable CloudTrail and review StackSet drift and State Manager compliance regularly.
+- The Lambda sends account ID, region, alarm name, state, and CloudWatch reason to Slack. Review the channel's data classification before deployment.
+
+---
+
+## Design boundaries
+
+- **Linux only.** Windows instances require a separate agent configuration and alarm strategy (`LogicalDisk` counter).
+- **Fleet-level alarms.** The warning and critical alarms evaluate the fleet maximum — they fire when *any* filesystem across all enrolled instances exceeds the threshold. The alarm message does not identify the specific filesystem; use the dashboard to investigate.
+- **OAM shares metrics only.** It does not install agents, attach profiles, or create alarms in member accounts.
+- **Ansible is supplementary.** State Manager is the continuous metric delivery mechanism. Ansible is for legacy bootstrap and on-demand audits only.
+
+---
+
+## Repository layout
+
+```text
+cloudformation/
+  member-account-stackset.yaml   Member IAM, SSM configuration and associations, OAM link
+  monitoring-account.yaml        OAM sink/policy, dashboard, alarms, SNS, Lambda
+cloudwatch/
+  agent-config.json              Readable copy of the CloudWatch Agent config embedded in the template
+  dashboard.json                 Reference template for dashboard widgets (see _comment field for manual use)
+ansible/
+  ansible.cfg
+  inventory.aws_ec2.yml          Dynamic EC2 inventory
+  requirements.yml
+  install-ssm-agent.yml          Legacy Linux SSM Agent bootstrap
+  disk-audit.yml                 On-demand disk audit playbook
+lambda/
+  slack-notification.py          Full source matching the inline Lambda in monitoring-account.yaml
+diagrams/
+  README.md                      Diagram export guidance
+```
+
+---
 
 ## Known production extensions
 
 - Per-filesystem alarm automation with lifecycle cleanup.
 - Windows `LogicalDisk` configuration.
-- PagerDuty or incident-management integration.
-- Dead-letter queue and retry controls for Slack delivery.
+- PagerDuty or incident-management integration replacing or supplementing Slack.
+- Dead-letter queue and retry controls for Lambda Slack delivery failures.
 - Automated canary metric and notification-path health checks.
-- CI checks using `cfn-lint`, `yamllint`, `ansible-lint`, and Python unit tests.
+- CI pipeline with `cfn-lint`, `yamllint`, `ansible-lint`, and Lambda unit tests.

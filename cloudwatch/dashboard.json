@@ -1,4 +1,5 @@
 {
+  "_comment": "Reference template only. To deploy manually via the AWS Console or CLI, replace REPLACE_WITH_YOUR_REGION with your monitoring account region, and replace REPLACE_WITH_WARNING_ALARM_ARN / REPLACE_WITH_CRITICAL_ALARM_ARN with the WarningAlarmArn and CriticalAlarmArn outputs from the monitoring-account CloudFormation stack. When deployed via CloudFormation (monitoring-account.yaml), substitution is automatic.",
   "start": "-PT24H",
   "periodOverride": "inherit",
   "widgets": [
@@ -16,7 +17,7 @@
         "title": "Highest disk utilization across linked source accounts",
         "view": "timeSeries",
         "stacked": false,
-        "region": "${AWS::Region}",
+        "region": "REPLACE_WITH_YOUR_REGION",
         "period": 300,
         "stat": "Maximum",
         "yAxis": {"left": {"min": 0, "max": 100}},
@@ -37,7 +38,7 @@
       "properties": {
         "title": "Fleet maximum disk utilization",
         "view": "singleValue",
-        "region": "${AWS::Region}",
+        "region": "REPLACE_WITH_YOUR_REGION",
         "period": 300,
         "metrics": [
           [{"expression": "SELECT MAX(disk_used_percent) FROM CWAgent", "label": "Maximum used %", "id": "q2", "period": 300}]
@@ -49,7 +50,7 @@
       "x": 12, "y": 10, "width": 12, "height": 6,
       "properties": {
         "title": "Disk alarms",
-        "alarms": ["${WarningAlarmArn}", "${CriticalAlarmArn}"]
+        "alarms": ["REPLACE_WITH_WARNING_ALARM_ARN", "REPLACE_WITH_CRITICAL_ALARM_ARN"]
       }
     }
   ]

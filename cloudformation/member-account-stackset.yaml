@@ -32,9 +32,69 @@ Resources:
           - Effect: Allow
             Principal: {Service: ec2.amazonaws.com}
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
-        - arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SsmAgentCorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SsmAgentOperations
+                Effect: Allow
+                Action:
+                  - ssm:DescribeAssociation
+                  - ssm:GetDeployablePatchSnapshotForInstance
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetManifest
+                  - ssm:ListAssociations
+                  - ssm:ListInstanceAssociations
+                  - ssm:PutInventory
+                  - ssm:PutComplianceItems
+                  - ssm:PutConfigurePackageResult
+                  - ssm:UpdateAssociationStatus
+                  - ssm:UpdateInstanceAssociationStatus
+                  - ssm:UpdateInstanceInformation
+                Resource: '*'
+              - Sid: SsmGetAgentConfigParameter
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AgentConfigParameterName}'
+              - Sid: SsmMessaging
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+              - Sid: SsmPackageDownload
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::aws-ssm-${AWS::Region}/*'
+        - PolicyName: CloudWatchAgentMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PublishCWAgentMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CWAgent
+              - Sid: Ec2DimensionsForAgent
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeTags
+                Resource: '*'
       Tags:
         - {Key: Solution, Value: CentralDiskMonitoring}
 
