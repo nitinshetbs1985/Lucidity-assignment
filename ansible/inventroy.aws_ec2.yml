@@ -1,17 +1,20 @@
+---
 plugin: amazon.aws.aws_ec2
 
 regions:
   - eu-central-1
 
+iam_role_arn: "arn:aws:iam::685385421611:role/AnsibleEC2AuditRole"
+
 filters:
   instance-state-name: running
   tag:Monitoring: enabled
 
-compose:
-  ansible_host: private_ip_address
-
 hostnames:
   - instance-id
 
+compose:
+  ansible_host: instance_id
+
 groups:
-  monitored: "'Monitoring' in (tags | default({}))"
+  monitored: "'enabled' in (ec2_tags | default({})).get('Monitoring', '')"

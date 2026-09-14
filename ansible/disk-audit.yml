@@ -1,15 +1,75 @@
 ---
-- name: Audit EC2 disk usage
+- name: EC2 Disk Audit
   hosts: monitored
-  become: false
+  connection: local
   gather_facts: false
 
   tasks:
-    - name: Check disk usage
-      ansible.builtin.command: df -hT
-      register: disk_usage
+
+    - name: Run disk audit through SSM
+      ansible.builtin.shell: |
+        set -e
+
+        ROLE_ARN="arn:aws:iam::685385421611:role/AnsibleEC2AuditRole"
+
+        CREDS=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name "ansible-disk-audit" \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+          --output text \
+          --no-cli-pager)
+
+        read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< "$CREDS"
+
+        export AWS_ACCESS_KEY_ID
+        export AWS_SECRET_ACCESS_KEY
+        export AWS_SESSION_TOKEN
+
+        COMMAND_ID=$(aws ssm send-command \
+          --region eu-central-1 \
+          --instance-ids {{ inventory_hostname }} \
+          --document-name AWS-RunShellScript \
+          --parameters 'commands=["echo === HOST ===","hostname","echo === DISK USAGE ===","df -hT","echo === DISKS ABOVE 80 PERCENT ===","df -P -x tmpfs -x devtmpfs | awk '\''NR > 1 {gsub(/%/,\"\",$5); if ($5 >= 80) print $0}'\''"]' \
+          --query 'Command.CommandId' \
+          --output text \
+          --no-cli-pager)
+
+        for i in {1..12}; do
+          STATUS=$(aws ssm get-command-invocation \
+            --region eu-central-1 \
+            --command-id "$COMMAND_ID" \
+            --instance-id {{ inventory_hostname }} \
+            --query 'Status' \
+            --output text \
+            --no-cli-pager)
+
+          if [[ "$STATUS" == "Success" ]]; then
+            break
+          fi
+
+          if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+            echo "SSM command failed with status: $STATUS"
+            exit 1
+          fi
+
+          sleep 5
+        done
+
+        aws ssm get-command-invocation \
+          --region eu-central-1 \
+          --command-id "$COMMAND_ID" \
+          --instance-id {{ inventory_hostname }} \
+          --query 'StandardOutputContent' \
+          --output text \
+          --no-cli-pager
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+
+      register: disk_audit
       changed_when: false
 
-    - name: Show disk usage
+    - name: Display disk audit
       ansible.builtin.debug:
-        var: disk_usage.stdout_lines
+        msg: "{{ disk_audit.stdout }}"

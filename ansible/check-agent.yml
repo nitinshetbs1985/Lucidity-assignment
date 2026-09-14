@@ -1,22 +1,75 @@
 ---
-- name: Check EC2 monitoring agents
+- name: EC2 Agent Status Check
   hosts: monitored
-  become: false
+  connection: local
   gather_facts: false
 
   tasks:
-    - name: Check SSM Agent
-      ansible.builtin.command: systemctl is-active amazon-ssm-agent
-      register: ssm
+
+    - name: Check SSM and CloudWatch Agent status through SSM
+      ansible.builtin.shell: |
+        set -e
+
+        ROLE_ARN="arn:aws:iam::685385421611:role/AnsibleEC2AuditRole"
+
+        CREDS=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name "ansible-agent-status" \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+          --output text \
+          --no-cli-pager)
+
+        read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< "$CREDS"
+
+        export AWS_ACCESS_KEY_ID
+        export AWS_SECRET_ACCESS_KEY
+        export AWS_SESSION_TOKEN
+
+        COMMAND_ID=$(aws ssm send-command \
+          --region eu-central-1 \
+          --instance-ids {{ inventory_hostname }} \
+          --document-name AWS-RunShellScript \
+          --parameters 'commands=["echo === HOST ===","hostname","echo === SSM AGENT ===","pgrep -af amazon-ssm-agent || true","echo === CLOUDWATCH AGENT ===","systemctl is-active amazon-cloudwatch-agent || true"]' \
+          --query 'Command.CommandId' \
+          --output text \
+          --no-cli-pager)
+
+        for i in {1..12}; do
+          STATUS=$(aws ssm get-command-invocation \
+            --region eu-central-1 \
+            --command-id "$COMMAND_ID" \
+            --instance-id {{ inventory_hostname }} \
+            --query 'Status' \
+            --output text \
+            --no-cli-pager)
+
+          if [[ "$STATUS" == "Success" ]]; then
+            break
+          fi
+
+          if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+            echo "SSM command failed with status: $STATUS"
+            exit 1
+          fi
+
+          sleep 5
+        done
+
+        aws ssm get-command-invocation \
+          --region eu-central-1 \
+          --command-id "$COMMAND_ID" \
+          --instance-id {{ inventory_hostname }} \
+          --query 'StandardOutputContent' \
+          --output text \
+          --no-cli-pager
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+
+      register: agent_status
       changed_when: false
 
-    - name: Check CloudWatch Agent
-      ansible.builtin.command: systemctl is-active amazon-cloudwatch-agent
-      register: cloudwatch
-      changed_when: false
-
-    - name: Show agent status
+    - name: Display agent status
       ansible.builtin.debug:
-        msg:
-          - "SSM Agent: {{ ssm.stdout }}"
-          - "CloudWatch Agent: {{ cloudwatch.stdout }}"
+        msg: "{{ agent_status.stdout }}"
