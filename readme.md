@@ -2,227 +2,91 @@
 
 ## Overview
 
-This project provides a minimal cross-account monitoring solution for EC2 disk utilization using:
+Minimal cross-account EC2 disk monitoring using:
 
-* AWS Systems Manager (SSM)
-* Amazon CloudWatch Agent
-* Amazon CloudWatch custom metrics
-* CloudWatch Observability Access Manager (OAM)
-* CloudWatch Dashboard
-* CloudWatch Alarm
+- AWS Systems Manager (SSM)
+- CloudWatch Agent
+- CloudWatch custom metrics
+- CloudWatch Observability Access Manager (OAM)
+- CloudWatch Dashboard and Alarm
+- Ansible for agent and disk audits
 
-The solution separates the **member/source account**, where EC2 instances run, from the **central monitoring account**, where monitoring data is consumed.
+Region: `eu-central-1`
 
-Notification integrations such as Slack, SNS, and email are intentionally excluded from this MVP.
+```text
+Member Account
+EC2 → SSM → CloudWatch Agent → CWAgent/disk_used_percent
+                                      │
+                                   OAM Link
+                                      │
+                                      ▼
+Monitoring Account
+OAM Sink → Dashboard / Alarm
+```
+
+Ansible is used separately for operational checks:
+
+```text
+Ansible EC2
+    │
+    └─ AssumeRole → AnsibleEC2AuditRole
+                         │
+                         └─ SSM Run Command → Target EC2
+```
+
+No Slack, SNS, Lambda, Secrets Manager, Ansible S3 or interactive SSM connection is required.
 
 ---
 
-## Architecture
+# 1. Repository
 
 ```text
-                    CENTRAL MONITORING ACCOUNT
-                    ──────────────────────────
-
-                         AWS OAM Sink
-                              │
-                              │
-                    ┌─────────┴─────────┐
-                    │                   │
-             CloudWatch Dashboard   CloudWatch Alarm
-                    │
-                    │
-════════════════════╪════════════════════════════════
-                    │
-                 OAM Link
-                    │
-                    │ Cross-account
-                    │ CloudWatch metrics
-                    │
-════════════════════╪════════════════════════════════
-                    │
-                    ▼
-                       MEMBER ACCOUNT
-                    ──────────────────
-
-                       EC2 Instances
-                            │
-                            │ SSM
-                            ▼
-                    CloudWatch Agent
-                            │
-                            │
-                    disk_used_percent
-                            │
-                            ▼
-                       CloudWatch
+project/
+├── monitoring-account.yaml
+├── member-account-stackset.yaml
+└── ansible/
+    ├── ansible.cfg
+    ├── inventory.aws_ec2.yml
+    ├── agent-status.yml
+    └── disk-audit.yml
 ```
 
 ---
 
-# Components
+# 2. Prerequisites
 
-## Monitoring Account
-
-The monitoring account contains:
-
-### OAM Sink
-
-An `AWS::Oam::Sink` receives observability data from the member account.
-
-The sink policy permits the member account to create/update an OAM Link for:
+Two AWS accounts are required:
 
 ```text
-AWS::CloudWatch::Metric
+Monitoring Account: <MONITORING-ACCOUNT-ID>
+Member Account:     <MEMBER-ACCOUNT-ID>
+Region:             eu-central-1
 ```
 
-### CloudWatch Dashboard
-
-The dashboard provides visibility into EC2 disk utilization metrics.
-
-Dashboard:
+Required AWS CLI profiles:
 
 ```text
-Sandbox-EC2-Disk-Monitoring
+<MONITORING-AWS-PROFILE>
+<MEMBER-AWS-PROFILE>
 ```
 
-### CloudWatch Alarm
-
-A basic CloudWatch alarm evaluates the EC2 disk utilization metric:
-
-```text
-Namespace: CWAgent
-Metric:    disk_used_percent
-```
-
----
-
-## Member Account
-
-The member account contains the resources required to collect and share EC2 disk metrics.
-
-### SSM
-
-AWS Systems Manager is used to manage the CloudWatch Agent on targeted EC2 instances.
-
-Instances are targeted using the tag:
-
-```text
-Monitoring=enabled
-```
-
-### CloudWatch Agent
-
-The CloudWatch Agent collects:
-
-```text
-disk_used_percent
-```
-
-at a five-minute interval.
-
-Metrics are published to:
-
-```text
-Namespace: CWAgent
-```
-
-### OAM Link
-
-An `AWS::Oam::Link` connects the member account to the OAM Sink in the monitoring account.
-
-Only CloudWatch metrics are shared by this MVP.
-
----
-
-# CloudFormation Templates
-
-The project uses two CloudFormation templates.
-
-## 1. Monitoring Account
-
-File:
-
-```text
-monitoring-account.yaml
-```
-
-Creates:
-
-* OAM Sink
-* OAM Sink Policy
-* CloudWatch Dashboard
-* CloudWatch Alarm
-
-No SNS, Slack, Lambda, or Secrets Manager resources are required.
-
----
-
-## 2. Member Account
-
-File:
-
-```text
-member-account-stackset.yaml
-```
-
-Creates/configures:
-
-* CloudWatch Agent configuration in SSM Parameter Store
-* SSM association for CloudWatch Agent installation
-* SSM association for CloudWatch Agent configuration
-* OAM Link
-* EC2 monitoring IAM role/instance profile where required
-
-### IAM role consideration
-
-The deployment requires permission to create IAM resources if the template creates the EC2 monitoring role.
-
-If the EC2 instances already have an appropriate IAM role providing:
-
-```text
-AmazonSSMManagedInstanceCore
-CloudWatchAgentServerPolicy
-```
-
-the existing role should preferably be reused rather than creating another IAM role.
-
----
-
-# Deployment Sequence
-
-The deployment must be performed in the following order.
-
-## Step 1 – Authenticate to AWS
-
-Authenticate to the appropriate AWS accounts using AWS IAM Identity Center / SSO.
-
-Verify the identity before deploying:
+Verify access:
 
 ```powershell
-aws sts get-caller-identity `
-  --profile <PROFILE> `
-  --no-cli-pager
-```
+aws sts get-caller-identity --profile <MONITORING-AWS-PROFILE> --no-cli-pager
 
-Confirm that the returned account is the intended target account.
+aws sts get-caller-identity --profile <MEMBER-AWS-PROFILE> --no-cli-pager
+```
 
 ---
 
-# Step 2 – Deploy the Monitoring Account Stack
+# 3. Deploy Monitoring Account
 
-Deploy:
-
-```text
-monitoring-account.yaml
-```
-
-to the central monitoring account.
-
-Example:
+Deploy `monitoring-account.yaml`:
 
 ```powershell
 aws cloudformation deploy `
-  --profile <MONITORING-PROFILE> `
+  --profile <MONITORING-AWS-PROFILE> `
   --region eu-central-1 `
   --stack-name sandbox-monitoring-sink `
   --template-file .\monitoring-account.yaml `
@@ -232,17 +96,11 @@ aws cloudformation deploy `
   --no-cli-pager
 ```
 
-The stack creates the OAM Sink and monitoring resources.
-
----
-
-# Step 3 – Retrieve the OAM Sink ARN
-
-After the monitoring stack has completed successfully, retrieve the Sink ARN:
+Retrieve the OAM Sink ARN:
 
 ```powershell
 aws cloudformation describe-stacks `
-  --profile <MONITORING-PROFILE> `
+  --profile <MONITORING-AWS-PROFILE> `
   --region eu-central-1 `
   --stack-name sandbox-monitoring-sink `
   --query "Stacks[0].Outputs[?OutputKey=='SinkArn'].OutputValue" `
@@ -250,33 +108,17 @@ aws cloudformation describe-stacks `
   --no-cli-pager
 ```
 
-Example output:
-
-```text
-arn:aws:oam:eu-central-1:<MONITORING-ACCOUNT-ID>:sink/<SINK-ID>
-```
-
-This ARN is required by the member-account deployment.
+Save the returned ARN for the member-account deployment.
 
 ---
 
-# Step 4 – Deploy the Member Account Stack
+# 4. Deploy Member Account
 
-Deploy:
-
-```text
-member-account-stackset.yaml
-```
-
-to the member account.
-
-Pass the OAM Sink ARN obtained in Step 3.
-
-Example:
+Deploy `member-account-stackset.yaml`:
 
 ```powershell
 aws cloudformation deploy `
-  --profile <MEMBER-PROFILE> `
+  --profile <MEMBER-AWS-PROFILE> `
   --region eu-central-1 `
   --stack-name sandbox-member-monitoring `
   --template-file .\member-account-stackset.yaml `
@@ -286,39 +128,40 @@ aws cloudformation deploy `
   --no-cli-pager
 ```
 
----
+The stack configures:
 
-# Step 5 – Verify the OAM Link
-
-Retrieve the OAM Link ARN:
-
-```powershell
-aws cloudformation describe-stacks `
-  --profile <MEMBER-PROFILE> `
-  --region eu-central-1 `
-  --stack-name sandbox-member-monitoring `
-  --query "Stacks[0].Outputs[?OutputKey=='OamLinkArn'].OutputValue" `
-  --output text `
-  --no-cli-pager
-```
-
-The member account should now have an OAM Link associated with the monitoring account's Sink.
+- EC2 monitoring IAM role and instance profile
+- CloudWatch Agent SSM parameter
+- CloudWatch Agent installation association
+- CloudWatch Agent configuration association
+- OAM Link
 
 ---
 
-# Step 6 – Verify EC2 Instances
+# 5. Prepare the EC2 Instance
 
-The CloudWatch Agent SSM associations target EC2 instances with:
+Target instances must be running and tagged:
 
 ```text
 Monitoring=enabled
 ```
 
-Verify the instances:
+Add the tag if required:
+
+```powershell
+aws ec2 create-tags `
+  --profile <MEMBER-AWS-PROFILE> `
+  --region eu-central-1 `
+  --resources <INSTANCE-ID> `
+  --tags Key=Monitoring,Value=enabled `
+  --no-cli-pager
+```
+
+Verify:
 
 ```powershell
 aws ec2 describe-instances `
-  --profile <MEMBER-PROFILE> `
+  --profile <MEMBER-AWS-PROFILE> `
   --region eu-central-1 `
   --filters "Name=tag:Monitoring,Values=enabled" `
   --query "Reservations[].Instances[].[InstanceId,State.Name]" `
@@ -328,59 +171,48 @@ aws ec2 describe-instances `
 
 ---
 
-# Step 7 – Verify SSM
+# 6. Verify SSM and CloudWatch Agent
 
-Confirm that the EC2 instances are registered with Systems Manager:
+Check SSM:
 
 ```powershell
 aws ssm describe-instance-information `
-  --profile <MEMBER-PROFILE> `
+  --profile <MEMBER-AWS-PROFILE> `
   --region eu-central-1 `
   --query "InstanceInformationList[].[InstanceId,PingStatus,AgentVersion]" `
   --output table `
   --no-cli-pager
 ```
 
-The expected state is:
+Expected:
 
 ```text
 PingStatus = Online
 ```
 
----
-
-# Step 8 – Verify CloudWatch Agent
-
-Verify the SSM associations responsible for:
-
-1. Installing the CloudWatch Agent
-2. Configuring the CloudWatch Agent
+Check CloudWatch Agent associations:
 
 ```powershell
 aws ssm list-associations `
-  --profile <MEMBER-PROFILE> `
+  --profile <MEMBER-AWS-PROFILE> `
   --region eu-central-1 `
   --output table `
   --no-cli-pager
 ```
 
-The CloudWatch Agent should be configured to collect:
+The agent publishes:
 
 ```text
-disk_used_percent
+Namespace: CWAgent
+Metric:    disk_used_percent
+Interval:  5 minutes
 ```
 
-every five minutes.
-
----
-
-# Step 9 – Verify CloudWatch Metrics
-
-From the member account, verify that the metric exists:
+Verify the source metric:
 
 ```powershell
 aws cloudwatch list-metrics `
-  --profile <MEMBER-PROFILE> `
+  --profile <MEMBER-AWS-PROFILE> `
   --region eu-central-1 `
   --namespace CWAgent `
   --metric-name disk_used_percent `
@@ -388,45 +220,11 @@ aws cloudwatch list-metrics `
   --no-cli-pager
 ```
 
-The metric should appear after the CloudWatch Agent has started publishing data.
-
 ---
 
-# Step 10 – Verify Cross-Account Monitoring
+# 7. Verify Monitoring
 
-Using the monitoring-account profile, verify that the member-account CloudWatch metrics are available through OAM.
-
-```powershell
-aws cloudwatch list-metrics `
-  --profile <MONITORING-PROFILE> `
-  --region eu-central-1 `
-  --namespace CWAgent `
-  --metric-name disk_used_percent `
-  --output table `
-  --no-cli-pager
-```
-
-This confirms the intended flow:
-
-```text
-Member EC2
-    ↓
-CloudWatch Agent
-    ↓
-CWAgent/disk_used_percent
-    ↓
-OAM Link
-    ↓
-OAM Sink
-    ↓
-Monitoring Account
-```
-
----
-
-# Step 11 – Verify Dashboard
-
-Open CloudWatch in the monitoring account and navigate to:
+In the monitoring account, open:
 
 ```text
 CloudWatch
@@ -434,41 +232,185 @@ CloudWatch
     → Sandbox-EC2-Disk-Monitoring
 ```
 
-Verify that the EC2 disk utilization data is visible.
+Verify the disk metric is visible.
+
+Also verify the CloudWatch alarm under:
+
+```text
+CloudWatch
+  → Alarms
+```
+
+The alarm evaluates:
+
+```text
+CWAgent / disk_used_percent
+```
 
 ---
 
-# Step 12 – Verify Alarm
+# 8. Ansible Setup
 
-Verify that the disk utilization alarm exists in the monitoring account.
+The Ansible controller is an EC2 instance in the monitoring account.
 
-The MVP alarm evaluates:
+Connect to the controller and run:
 
-```text
-Namespace:
-CWAgent
-
-Metric:
-disk_used_percent
+```bash
+cd /home/ec2-user/fluidity-assignment/ansible
 ```
 
-The alarm is currently intended as a monitoring/validation mechanism.
+Verify:
 
-Notification delivery is outside the scope of this MVP.
+```bash
+ansible --version
+aws --version
+ansible-galaxy collection list
+```
+
+The `amazon.aws` collection is required.
+
+Verify the controller identity:
+
+```bash
+aws sts get-caller-identity --no-cli-pager
+```
+
+It should use the monitoring-account controller role.
+
+If temporary AWS credentials were previously exported:
+
+```bash
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
+unset AWS_SESSION_TOKEN
+```
 
 ---
 
-# Troubleshooting
+# 9. Ansible Inventory
 
-## CloudFormation stack is ROLLBACK_COMPLETE
-
-A stack in:
+File:
 
 ```text
-ROLLBACK_COMPLETE
+ansible/inventory.aws_ec2.yml
 ```
 
-cannot be updated.
+The inventory discovers:
+
+- running EC2 instances
+- tagged `Monitoring=enabled`
+
+and uses:
+
+```text
+AnsibleEC2AuditRole
+```
+
+for member-account access.
+
+Verify:
+
+```bash
+ansible-inventory --graph
+```
+
+Expected:
+
+```text
+@all:
+  |--@aws_ec2:
+  |  |--i-xxxxxxxxxxxxxxxxx
+  |--@monitored:
+  |  |--i-xxxxxxxxxxxxxxxxx
+```
+
+---
+
+# 10. Agent Status Audit
+
+Run:
+
+```bash
+ansible-playbook agent-status.yml
+```
+
+The playbook checks:
+
+- SSM Agent
+- CloudWatch Agent
+
+For Ubuntu instances using the Snap-based SSM Agent, the audit checks the running process rather than relying only on the traditional systemd service.
+
+---
+
+# 11. Disk Audit
+
+Run:
+
+```bash
+ansible-playbook disk-audit.yml
+```
+
+The playbook reports filesystem usage and identifies filesystems at or above:
+
+```text
+80%
+```
+
+Example:
+
+```text
+=== DISK USAGE ===
+
+Filesystem     Type   Size  Used Avail Use% Mounted on
+/dev/root      ext4   6.8G  4.8G  2.0G  71% /
+
+=== DISKS ABOVE 80 PERCENT ===
+```
+
+An empty final section means no filesystem is at or above the threshold.
+
+---
+
+# 12. Final Validation
+
+Run from the Ansible controller:
+
+```bash
+cd /home/ec2-user/fluidity-assignment/ansible
+
+ansible-inventory --graph
+
+ansible-playbook agent-status.yml
+
+ansible-playbook disk-audit.yml
+```
+
+The MVP is complete when:
+
+```text
+EC2
+ ↓
+SSM
+ ↓
+CloudWatch Agent
+ ↓
+CWAgent/disk_used_percent
+ ↓
+OAM Link
+ ↓
+OAM Sink
+ ↓
+Dashboard / Alarm
+```
+
+and the Ansible audits successfully report agent status and disk utilization.
+
+---
+
+# 13. Troubleshooting
+
+## CloudFormation ROLLBACK_COMPLETE
 
 Delete the failed stack:
 
@@ -480,7 +422,7 @@ aws cloudformation delete-stack `
   --no-cli-pager
 ```
 
-Wait for deletion:
+Then wait:
 
 ```powershell
 aws cloudformation wait stack-delete-complete `
@@ -489,165 +431,77 @@ aws cloudformation wait stack-delete-complete `
   --stack-name <STACK-NAME>
 ```
 
-Then redeploy.
+Redeploy afterwards.
 
----
+## Ansible Cannot Find an Instance
 
-## CloudFormation Early Validation Error
-
-For an early validation failure, inspect CloudFormation events:
-
-```powershell
-aws cloudformation describe-events `
-  --profile <PROFILE> `
-  --region eu-central-1 `
-  --stack-name <STACK-NAME> `
-  --no-cli-pager `
-  --output table
-```
-
-Do not modify the template based only on the generic:
+Check:
 
 ```text
-AWS::EarlyValidation::PropertyValidation
-```
-
-Retrieve the detailed validation event first.
-
----
-
-## IAM CreateRole Permission Error
-
-If deployment fails with:
-
-```text
-iam:CreateRole
-```
-
-the deployment identity does not have permission to create the IAM role.
-
-Options:
-
-1. Reuse an existing EC2 IAM role with the required SSM and CloudWatch Agent permissions.
-2. Request the required IAM permissions for the deployment role.
-3. Remove IAM role creation from the CloudFormation template and manage the EC2 role separately.
-
-For a minimal sandbox implementation, option 1 or 3 is preferred where possible.
-
----
-
-# Design Principles
-
-The MVP intentionally follows these principles:
-
-### 1. No centralized delegated administrator
-
-The solution does not require:
-
-* AWS Organizations delegated administration
-* Control Tower delegated administration
-* A separate central management account
-* StackSets from an organization management account
-
-The OAM Sink is created directly in the monitoring account.
-
----
-
-### 2. Minimal cross-account access
-
-The OAM Sink policy allows the designated member account to create/update the OAM Link and share:
-
-```text
-AWS::CloudWatch::Metric
-```
-
-No broader observability resource types are required for the MVP.
-
----
-
-### 3. SSM-based agent management
-
-SSM is used to install and configure the CloudWatch Agent on EC2 instances tagged:
-
-```text
+Instance state = running
 Monitoring=enabled
 ```
 
-This avoids manually installing/configuring the agent on each instance.
+Then:
+
+```bash
+ansible-inventory --graph
+```
+
+## Ansible AccessDenied on SSM
+
+The playbook must assume:
+
+```text
+AnsibleEC2AuditRole
+```
+
+Do not add `ssm:SendCommand` to the monitoring controller role just to resolve this error.
+
+## SSM Agent Appears Inactive
+
+On Snap-based Ubuntu installations:
+
+```bash
+pgrep -af amazon-ssm-agent
+```
+
+or:
+
+```bash
+snap services amazon-ssm-agent
+```
+
+may be more accurate than:
+
+```bash
+systemctl is-active amazon-ssm-agent
+```
 
 ---
 
-### 4. No notification infrastructure
+# 14. MVP Scope
 
-The MVP deliberately excludes:
+Included:
+
+- Cross-account CloudWatch metric sharing with OAM
+- EC2 disk monitoring
+- CloudWatch Dashboard
+- CloudWatch Alarm
+- SSM-based CloudWatch Agent management
+- Ansible agent-status audit
+- Ansible disk audit
+
+Not included:
 
 ```text
-SNS
 Slack
+SNS
+Email
 Lambda
 Secrets Manager
-Email
+Ansible S3
+Interactive Session Manager for Ansible
+Control Tower delegated administration
+AWS Organizations delegated administration
 ```
-
-These can be added later without changing the core OAM architecture.
-
----
-
-# Future Enhancements
-
-Once the basic monitoring path is proven, the solution can be extended with:
-
-* SNS notifications
-* Slack integration
-* Email notifications
-* More precise disk alarms
-* Per-instance dashboards
-* Additional EC2 metrics
-* CPU and memory monitoring
-* Filesystem-specific alarms
-* Auto Scaling dimensions
-* Additional OAM resource types
-* Infrastructure deployment through CI/CD
-
-These enhancements should be added only after the core:
-
-```text
-EC2 → CloudWatch Agent → OAM Link → OAM Sink → Dashboard
-```
-
-flow is confirmed to work.
-
----
-
-# Current MVP Scope
-
-```text
-┌──────────────────────────────────────────────┐
-│              MEMBER ACCOUNT                  │
-│                                              │
-│  EC2                                         │
-│   │                                          │
-│   ├── SSM                                    │
-│   │                                          │
-│   └── CloudWatch Agent                       │
-│            │                                 │
-│            └── disk_used_percent             │
-│                      │                       │
-│                  OAM Link                    │
-└──────────────────────┼───────────────────────┘
-                       │
-                       │ CloudWatch Metrics
-                       ▼
-┌──────────────────────────────────────────────┐
-│           MONITORING ACCOUNT                 │
-│                                              │
-│               OAM Sink                       │
-│                  │                           │
-│          ┌───────┴────────┐                  │
-│          ▼                ▼                  │
-│      Dashboard          Alarm                 │
-│                                              │
-└──────────────────────────────────────────────┘
-```
-
-The objective of this MVP is to prove **secure cross-account EC2 disk monitoring using CloudWatch OAM**, while keeping the infrastructure and operational dependencies to a minimum.

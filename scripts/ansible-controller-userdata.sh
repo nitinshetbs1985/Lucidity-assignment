@@ -1,21 +1,35 @@
 #!/bin/bash
 # =============================================================================
 # Ansible Controller – EC2 User Data
-# Target OS : Amazon Linux 2023 (x86_64 or aarch64)
-# Purpose   : Bootstrap a host that can run the disk-monitoring-solution
-#             Ansible playbooks (disk-audit.yml, install-ssm-agent.yml)
-#             against EC2 targets via SSH and dynamic EC2 inventory.
+# Target OS : Amazon Linux 2023 (x86_64 / aarch64)
+# Purpose   : Bootstrap an Ansible controller for the AWS cross-account
+#             EC2 disk monitoring solution.
 #
-# After launch:
-#   1. Attach an IAM instance profile that includes ec2:DescribeInstances
-#      and ec2:DescribeTags (needed by the aws_ec2 inventory plugin).
-#   2. Copy the project to /opt/disk-monitoring (see NEXT_STEPS.txt).
-#   3. sudo su - ansible  →  cd /opt/disk-monitoring/ansible
+# Ansible artifacts:
+#   ansible.cfg
+#   inventory.aws_ec2.yml
+#   agent-status.yml
+#   disk-audit.yml
+#
+# Architecture:
+#   Ansible Controller
+#       |
+#       +-- AssumeRole --> Member Account AnsibleEC2AuditRole
+#                              |
+#                              +-- SSM SendCommand --> Target EC2
+#
+# NOTE:
+#   Ansible does NOT use the amazon.aws.aws_ssm connection plugin.
+#   Ansible does NOT require an S3 bucket.
+#   Ansible does NOT use an interactive Session Manager connection.
 # =============================================================================
+
 set -euo pipefail
 
 LOG=/var/log/userdata-setup.log
+
 exec > >(tee -a "$LOG") 2>&1
+
 echo "======================================================================"
 echo " Ansible controller setup started: $(date)"
 echo "======================================================================"
@@ -24,6 +38,7 @@ echo "======================================================================"
 # 1. System update and base packages
 # ------------------------------------------------------------------------------
 echo "--- [1/7] Updating system and installing base packages ---"
+
 dnf update -y
 
 dnf install -y \
@@ -35,217 +50,342 @@ dnf install -y \
   rsync \
   openssh-clients
 
-# Make python3.11 / pip3.11 the default python3 / pip3 for new shells
-update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 2
-update-alternatives --install /usr/bin/pip3    pip3    /usr/bin/pip3.11    2
+# Make Python 3.11 the default python3 / pip3
+update-alternatives --install \
+  /usr/bin/python3 python3 /usr/bin/python3.11 2
+
+update-alternatives --install \
+  /usr/bin/pip3 pip3 /usr/bin/pip3.11 2
 
 # ------------------------------------------------------------------------------
-# 2. Ansible Core and AWS SDK
+# 2. Install AWS CLI v2
 # ------------------------------------------------------------------------------
-echo "--- [2/7] Installing ansible-core, boto3, botocore ---"
+echo "--- [2/7] Installing AWS CLI v2 ---"
 
-# Upgrade pip itself first to avoid bdist_wheel errors
-python3 -m pip install --upgrade pip setuptools wheel
+if ! command -v aws >/dev/null 2>&1; then
 
-# ansible-core 2.16+ requires Python >= 3.10 on the controller (satisfied by 3.11)
-# boto3/botocore are required by the amazon.aws.aws_ec2 dynamic inventory plugin
+  ARCH="$(uname -m)"
+
+  case "$ARCH" in
+    x86_64)
+      AWS_CLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+      ;;
+    aarch64)
+      AWS_CLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"
+      ;;
+    *)
+      echo "Unsupported architecture: $ARCH"
+      exit 1
+      ;;
+  esac
+
+  TMP_DIR="$(mktemp -d)"
+
+  curl -fsSL "$AWS_CLI_URL" \
+    -o "$TMP_DIR/awscliv2.zip"
+
+  unzip -q "$TMP_DIR/awscliv2.zip" \
+    -d "$TMP_DIR"
+
+  "$TMP_DIR/aws/install" \
+    --update
+
+  rm -rf "$TMP_DIR"
+
+fi
+
+echo "  AWS CLI version:"
+aws --version
+
+# ------------------------------------------------------------------------------
+# 3. Install Session Manager Plugin
+# ------------------------------------------------------------------------------
+echo "--- [3/7] Installing Session Manager Plugin ---"
+
+if ! command -v session-manager-plugin >/dev/null 2>&1; then
+
+  ARCH="$(uname -m)"
+
+  case "$ARCH" in
+    x86_64)
+      SSM_PLUGIN_RPM="https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm"
+      ;;
+    aarch64)
+      SSM_PLUGIN_RPM="https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_arm64/session-manager-plugin.rpm"
+      ;;
+    *)
+      echo "Unsupported architecture: $ARCH"
+      exit 1
+      ;;
+  esac
+
+  TMP_RPM="$(mktemp --suffix=.rpm)"
+
+  curl -fsSL "$SSM_PLUGIN_RPM" \
+    -o "$TMP_RPM"
+
+  dnf install -y "$TMP_RPM"
+
+  rm -f "$TMP_RPM"
+
+fi
+
+echo "  Session Manager Plugin:"
+session-manager-plugin --version || true
+
+# ------------------------------------------------------------------------------
+# 4. Install Ansible Core and AWS SDK
+# ------------------------------------------------------------------------------
+echo "--- [4/7] Installing Ansible Core and AWS SDK ---"
+
+python3 -m pip install --upgrade \
+  pip \
+  setuptools \
+  wheel
+
 python3 -m pip install \
   "ansible-core>=2.16" \
   "boto3>=1.34" \
   "botocore>=1.34"
 
-# Ensure pip-installed binaries (ansible, ansible-galaxy, etc.) are on PATH
-# for all users and login shells
-echo 'export PATH=$PATH:/usr/local/bin' > /etc/profile.d/ansible-path.sh
+# Ensure pip-installed binaries are available system-wide
+cat > /etc/profile.d/ansible-path.sh <<'PATHCFG'
+export PATH="$PATH:/usr/local/bin"
+PATHCFG
+
 chmod +x /etc/profile.d/ansible-path.sh
-export PATH=$PATH:/usr/local/bin
 
-echo "  ansible-core version: $(ansible --version | head -1)"
+export PATH="$PATH:/usr/local/bin"
+
+echo "  Ansible:"
+ansible --version | head -1
+
+echo "  Python:"
+python3 --version
 
 # ------------------------------------------------------------------------------
-# 3. Ansible controller user
+# 5. Create Ansible controller user
 # ------------------------------------------------------------------------------
-echo "--- [3/7] Creating ansible user ---"
+echo "--- [5/7] Creating ansible user ---"
 
-id ansible &>/dev/null || useradd -m -s /bin/bash -c "Ansible controller" ansible
+if ! id ansible >/dev/null 2>&1; then
+  useradd \
+    -m \
+    -s /bin/bash \
+    -c "Ansible controller" \
+    ansible
+fi
 
-# Password-less sudo — needed for become:true in install-ssm-agent.yml
-echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ansible
-chmod 440 /etc/sudoers.d/ansible
+# PATH for login shells
+cat > /home/ansible/.bashrc_ansible <<'EOF'
+export PATH="$PATH:/usr/local/bin"
+EOF
 
-# Make sure PATH is also set for the ansible user's non-interactive shells
-echo 'export PATH=$PATH:/usr/local/bin' >> /home/ansible/.bashrc
+cat /home/ansible/.bashrc_ansible >> /home/ansible/.bashrc
+
+chown ansible:ansible /home/ansible/.bashrc_ansible
 chown ansible:ansible /home/ansible/.bashrc
 
 # ------------------------------------------------------------------------------
-# 4. SSH key for connecting to legacy Linux target hosts
+# 6. Install amazon.aws collection
 # ------------------------------------------------------------------------------
-echo "--- [4/7] Generating SSH key pair for Ansible connections ---"
+echo "--- [6/7] Installing amazon.aws Ansible collection ---"
 
-SSH_DIR=/home/ansible/.ssh
-mkdir -p "$SSH_DIR"
+su - ansible -c \
+  "/usr/local/bin/ansible-galaxy collection install amazon.aws"
 
-ssh-keygen -t ed25519 \
-  -f "$SSH_DIR/id_ansible" \
-  -N "" \
-  -C "ansible-controller-$(hostname -s)"
-
-# SSH client config:
-#   StrictHostKeyChecking accept-new  — trusts on first connect, rejects changed
-#   keys. This honours the project's host_key_checking = True setting in
-#   ansible.cfg without requiring manual known_hosts population.
-cat > "$SSH_DIR/config" <<'SSHCFG'
-Host *
-    StrictHostKeyChecking accept-new
-    IdentityFile          ~/.ssh/id_ansible
-    ConnectTimeout        10
-    ServerAliveInterval   60
-    ServerAliveCountMax   3
-SSHCFG
-
-chmod 700 "$SSH_DIR"
-chmod 600 "$SSH_DIR/id_ansible"
-chmod 644 "$SSH_DIR/id_ansible.pub"
-chmod 600 "$SSH_DIR/config"
-chown -R ansible:ansible "$SSH_DIR"
-
-echo "  Public key (add to ~/.ssh/authorized_keys on each legacy target host):"
-cat "$SSH_DIR/id_ansible.pub"
+echo "  Installed amazon.aws collection:"
+su - ansible -c \
+  "/usr/local/bin/ansible-galaxy collection list amazon.aws"
 
 # ------------------------------------------------------------------------------
-# 5. Install amazon.aws Ansible collection
+# 7. Create project directory and next steps
 # ------------------------------------------------------------------------------
-echo "--- [5/7] Installing amazon.aws collection for the ansible user ---"
-
-# Run as ansible so the collection lands in ~/.ansible/collections — the path
-# Ansible resolves relative to the running user, matching the project's
-# default ansible.cfg (no custom collections_paths set).
-su - ansible -c "/usr/local/bin/ansible-galaxy collection install amazon.aws" \
-  2>&1 | tee -a "$LOG"
-
-echo "  Installed collections:"
-su - ansible -c "/usr/local/bin/ansible-galaxy collection list amazon.aws"
-
-# ------------------------------------------------------------------------------
-# 6. Project directory
-# ------------------------------------------------------------------------------
-echo "--- [6/7] Creating project directory ---"
+echo "--- [7/7] Creating project directory ---"
 
 PROJECT_DIR=/opt/disk-monitoring
+
 mkdir -p "$PROJECT_DIR"
-chown ansible:ansible "$PROJECT_DIR"
+mkdir -p "$PROJECT_DIR/ansible"
 
-# ------------------------------------------------------------------------------
-# 7. Next-steps guidance file
-# ------------------------------------------------------------------------------
-echo "--- [7/7] Writing NEXT_STEPS.txt ---"
-
-PUBLIC_KEY=$(cat "$SSH_DIR/id_ansible.pub")
+chown -R ansible:ansible "$PROJECT_DIR"
 
 cat > "$PROJECT_DIR/NEXT_STEPS.txt" <<STEPS
 =======================================================================
  Ansible Controller — Ready
- Setup log: $LOG
- Setup completed: $(date)
+ Setup log       : $LOG
+ Setup completed : $(date)
 =======================================================================
 
-BEFORE YOU START
+ARCHITECTURE
+------------
+This controller runs the Ansible AWS dynamic inventory and operational
+audit playbooks.
+
+Ansible uses:
+
+  Monitoring Account EC2 Role
+          |
+          +-- sts:AssumeRole
+                    |
+                    v
+          Member Account AnsibleEC2AuditRole
+                    |
+                    +-- SSM SendCommand
+                              |
+                              v
+                         Target EC2
+
+The Ansible solution does NOT use:
+
+  - amazon.aws.aws_ssm connection plugin
+  - S3 bucket
+  - S3 object transfer
+  - Interactive Session Manager for Ansible
+
+
+IAM REQUIREMENTS
 ----------------
-Attach an IAM instance profile to this EC2 instance that includes at
-minimum:
+The EC2 instance profile attached to this controller must provide:
 
   ec2:DescribeInstances
   ec2:DescribeTags
 
-These permissions are required by the amazon.aws.aws_ec2 dynamic
-inventory plugin used in inventory.aws_ec2.yml.
+and:
+
+  sts:AssumeRole
+
+to:
+
+  arn:aws:iam::<MEMBER-ACCOUNT-ID>:role/AnsibleEC2AuditRole
 
 
-STEP 1 — Copy the project to this machine
-------------------------------------------
-From your workstation (where you downloaded disk-monitoring-solution):
+MEMBER ACCOUNT ROLE
+-------------------
+The member account must contain:
 
-  rsync -avz --exclude='.git' \\
-    ./disk-monitoring-solution/ \\
-    ansible@$(hostname -f):$PROJECT_DIR/
+  AnsibleEC2AuditRole
 
-Or use SCP:
+Its trust relationship must allow the monitoring-account controller
+role to assume it.
 
-  scp -r ./disk-monitoring-solution/* \\
-    ansible@$(hostname -f):$PROJECT_DIR/
+The role must allow SSM SendCommand against instances tagged:
+
+  Monitoring=enabled
 
 
-STEP 2 — Switch to the ansible user
--------------------------------------
+STEP 1 — Switch to ansible user
+--------------------------------
   sudo su - ansible
 
 
-STEP 3 — Configure the inventory region
------------------------------------------
+STEP 2 — Go to the project
+----------------------------
   cd $PROJECT_DIR/ansible
-  vi inventory.aws_ec2.yml
-
-  Replace:
-    - <type your region example eu-central-1>
-  With your actual region, e.g.:
-    - us-east-1
 
 
-STEP 4 — Install the collection from requirements.yml
--------------------------------------------------------
+STEP 3 — Copy the project files
+--------------------------------
+Copy the following files into:
+
+  $PROJECT_DIR/
+
+  monitoring-account.yaml
+  member-account-stackset.yaml
+
+And into:
+
+  $PROJECT_DIR/ansible/
+
+  ansible.cfg
+  inventory.aws_ec2.yml
+  agent-status.yml
+  disk-audit.yml
+
+
+STEP 4 — Verify AWS identity
+-----------------------------
+  aws sts get-caller-identity --no-cli-pager
+
+The normal identity should be the monitoring-account EC2 controller
+role.
+
+
+STEP 5 — Verify Ansible inventory
+----------------------------------
   cd $PROJECT_DIR/ansible
-  ansible-galaxy collection install -r requirements.yml
 
-
-STEP 5 — Verify the dynamic inventory
----------------------------------------
   ansible-inventory --graph
 
-  You should see groups: monitored_linux, legacy_linux, and env_* groups
-  based on the Environment tag of your running EC2 instances.
+Only running EC2 instances tagged:
+
+  Monitoring=enabled
+
+should appear in the monitored group.
 
 
-STEP 6 — Run the disk audit (read-only)
------------------------------------------
-  ansible-playbook disk-audit.yml \\
-    --limit monitored_linux \\
-    -e disk_threshold=80
+STEP 6 — Run agent status audit
+--------------------------------
+  ansible-playbook agent-status.yml
 
 
-STEP 7 — Bootstrap SSM Agent on legacy hosts (if needed)
-----------------------------------------------------------
-  ansible-playbook install-ssm-agent.yml \\
-    -e aws_region=us-east-1 \\
-    --limit legacy_linux
+STEP 7 — Run disk audit
+------------------------
+  ansible-playbook disk-audit.yml
 
 
-LEGACY HOST SSH ACCESS
------------------------
-Add the public key below to ~/.ssh/authorized_keys on each legacy target
-host. The key was generated during this controller setup.
-
-  $PUBLIC_KEY
-
-
-TROUBLESHOOTING
+EXPECTED RESULT
 ---------------
-  ansible --version                              Check Ansible is installed
-  python3 --version                              Should be 3.11.x
-  ansible-galaxy collection list amazon.aws      Verify collection installed
-  cat $LOG                   Full setup log
+Agent status should show:
+
+  SSM Agent      : running
+  CloudWatch     : active
+
+Disk audit should report filesystem utilization and identify any
+filesystem at or above the configured 80 percent threshold.
+
+
+USEFUL CHECKS
+-------------
+  ansible --version
+  python3 --version
+  aws --version
+  session-manager-plugin --version
+  ansible-galaxy collection list amazon.aws
+  ansible-inventory --graph
+
+Setup log:
+
+  $LOG
 STEPS
 
 chown ansible:ansible "$PROJECT_DIR/NEXT_STEPS.txt"
 
-# ------------------------------------------------------------------------------
-# Done
-# ------------------------------------------------------------------------------
 echo ""
 echo "======================================================================"
-echo " Setup complete: $(date)"
-echo " Public key (add to legacy target hosts):"
-cat "$SSH_DIR/id_ansible.pub"
+echo " Ansible controller setup complete: $(date)"
 echo ""
-echo " Next steps: cat $PROJECT_DIR/NEXT_STEPS.txt"
-echo " Full log  : $LOG"
+echo " AWS CLI:"
+aws --version
+
+echo ""
+echo " Ansible:"
+ansible --version | head -1
+
+echo ""
+echo " Python:"
+python3 --version
+
+echo ""
+echo " Session Manager Plugin:"
+session-manager-plugin --version || true
+
+echo ""
+echo " Next steps:"
+echo "   cat $PROJECT_DIR/NEXT_STEPS.txt"
+
+echo ""
+echo " Full setup log:"
+echo "   $LOG"
+
 echo "======================================================================"
